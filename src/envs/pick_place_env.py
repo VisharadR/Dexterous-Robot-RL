@@ -138,7 +138,7 @@ class PickPlaceEnv(gym.Env):
         self._load_world()
 
         # randomize cube XY a bit for diversity
-        jitter = np.random.uniform(low=[-0.07, -0.07], high=[0.07, 0.07])
+        jitter = np.random.uniform(low=[-0.02, -0.02], high=[0.02, 0.02])
         cube_pos = np.array([0.5, 0.05, 0.02]) + np.append(jitter, 0.0)
         p.resetBasePositionAndOrientation(self.cube_id, cube_pos, [0,0,0,1])
 
@@ -184,18 +184,45 @@ class PickPlaceEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _compute_reward_done(self):
+        # positions
+        ee_pos, _ = self._get_ee_pose()
         cube = self._get_cube_pose()
-        # success if cube is near goal XY and lifted
-        near_goal = np.linalg.norm(cube[:2] - self.goal_xy) < 0.08
+        goal_xy = self.goal_xy
+
+        # distance terms
+        dist_ee_cube = np.linalg.norm(ee_pos - cube)                # 3D
+        dist_cube_goal = np.linalg.norm(cube[:2] - goal_xy)         # XY
+
+        # shaping weights (tune as needed)
+        w_reach = 0.5     # encourage EE near cube
+        w_lift  = 2.0     # encourage lifting
+        w_goal  = 0.5     # encourage moving cube toward goal
+        w_time  = 0.0005  # small time penalty
+
+        # normalize-ish baselines to keep rewards in a sane range
+        reach_reward = -w_reach * dist_ee_cube                      # closer is better
+        lift_reward  =  w_lift * max(0.0, cube[2] - 0.03)           # above table plane
+        goal_reward  = -w_goal * dist_cube_goal                     # closer to goal
+
+        # crude grasp heuristic: if gripper is closed and cube is above 0.05m, give a little bonus
+        # (you can do better by checking contact points)
+        grasp_bonus = 0.0
+        finger_left = p.getJointState(self.robot_id, 9)[0]
+        finger_right = p.getJointState(self.robot_id,10)[0]
+        gripper_closed = (finger_left < 0.01 and finger_right < 0.01)
+        if gripper_closed and cube[2] > 0.05:
+            grasp_bonus = 0.2
+
+        # success condition
+        near_goal = dist_cube_goal < 0.08
         lifted = cube[2] > 0.15
-        reward = 0.0
-        if lifted:
-            reward += 0.5
-        if near_goal and lifted:
-            reward += 0.5
-        done = bool(near_goal and lifted)
-        # small time penalty to encourage efficiency
-        reward -= 0.001
+        success = (near_goal and lifted)
+
+        reward = reach_reward + lift_reward + goal_reward + grasp_bonus - w_time
+        if success:
+            reward += 2.0  # terminal success bonus
+
+        done = bool(success)
         return float(reward), done
 
     def render(self):
