@@ -24,7 +24,7 @@ LOG_DIR = os.path.join("results", RUN_NAME)
 SAVE_DIR = os.path.join(LOG_DIR, "models")
 EVAL_DIR = os.path.join(LOG_DIR, "eval")
 
-TOTAL_TIMESTEPS = 1_000_000   # bump if training plateaus early
+TOTAL_TIMESTEPS = 1_200_000   # bump if training plateaus early
 N_ENVS = 4                  # try 1 if your CPU is weak
 SEED = 42
 EVAL_EPISODES = 10

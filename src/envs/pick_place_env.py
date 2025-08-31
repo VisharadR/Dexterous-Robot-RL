@@ -17,34 +17,67 @@ class PickPlaceEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"]}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, domain_randomization: bool = False):
         super().__init__()
         self.render_mode = render_mode
+        self.domain_randomization = bool(domain_randomization)
 
-        # action: [dx, dy, dz, grip] where grip in [-1,1] (close / open)
-        self.action_space = spaces.Box(low=np.array([-0.02, -0.02, -0.02, -1.0]),
-                                       high=np.array([ 0.02,  0.02,  0.02,  1.0]),
-                                       dtype=np.float32)
+        # Small deltas for stable control
+        self.action_space = spaces.Box(
+            low=np.array([-0.01, -0.01, -0.01, -1.0], dtype=np.float32),
+            high=np.array([ 0.01,  0.01,  0.01,  1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
 
-        # obs: [ee(xyz), ee(yaw), obj(xyz)]
-        high = np.array([np.inf]*7, dtype=np.float32)
+        # [ee(x,y,z), ee_yaw, cube(x,y,z)]
+        high = np.array([np.inf] * 7, dtype=np.float32)
         self.observation_space = spaces.Box(-high, high, dtype=np.float32)
 
-        self.physics_client = None
-        self.time_step = 1./240.
-        self.max_steps = 200
+        # Sim config
+        self.time_step = 1.0 / 240.0
+        self.max_steps = 300
         self.step_count = 0
 
-        # internal ids
+        # IDs
+        self.physics_client = None
         self.robot_id = None
-        self.ee_link_id = None
+        self.ee_link_id = 11  # panda_hand link index in pybullet_data/franka_panda
         self.table_id = None
         self.cube_id = None
-        self.goal_xy = np.array([0.5, 0.0], dtype=np.float32)  # simple goal on table
+
+        # Goal and curriculum
+        self.goal_xy = np.array([0.5, 0.0], dtype=np.float32)
+        self._easy_mode = True
+        self._easy_jitter_xy = 0.02  # 2 cm (start easy)
+        self._hard_jitter_xy = 0.07  # 7 cm (later)
+        self._grasp_locked_steps = 0         # counts down when we’ve closed near the cube
+        self._grasp_lock_horizon = 30        # keep closed ~30 steps after closing near object
+        self.approach_height = 0.035         # target hover height above cube before closing
+
+
+        # Success logic (can be staged)
+        self.success_mode = "lift" # "and" | "and" | "lift" | "near"
+        self.lift_thresh = 0.06   # was 0.12; stage-1 target ~6 cm
+        self.success_bonus = 8.0  # a bit more pop when we do lift
+
+        # Reward weights / thresholds
+        self.w_reach = 0.25
+        self.w_goal = 0.25
+        self.w_lift = 2.0
+        self.w_time = 0.0005
+        self.success_bonus = 6.0
+        self.near_thresh = 0.10   # start lenient; tighten later
+        self.lift_thresh = 0.12   # start lenient; tighten later
+
+        # For potential-based shaping
+        self._last_dist_ee_cube = None
+        self._last_dist_cube_goal = None
 
         self._connect()
 
-    # ---------- setup ----------
+    # --------------------------------------------------------------------- #
+    # Setup
+    # --------------------------------------------------------------------- #
     def _connect(self):
         if self.render_mode == "human":
             self.physics_client = p.connect(p.GUI)
@@ -60,60 +93,78 @@ class PickPlaceEnv(gym.Env):
         p.setGravity(0, 0, -9.81)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-        # plane + table
+        # Ground + table
         p.loadURDF("plane.urdf")
         table_shift = [0.5, 0.0, -0.65]
         self.table_id = p.loadURDF("table/table.urdf", basePosition=table_shift)
 
-        # robot: Franka Panda (in pybullet_data)
-        robot_start_pos = [0.0, 0.0, 0.0]
-        robot_start_ori = p.getQuaternionFromEuler([0, 0, 0])
-        self.robot_id = p.loadURDF("franka_panda/panda.urdf",
-                                   basePosition=robot_start_pos,
-                                   baseOrientation=robot_start_ori,
-                                   useFixedBase=True)
+        # Robot (fixed base)
+        self.robot_id = p.loadURDF(
+            "franka_panda/panda.urdf",
+            basePosition=[0.0, 0.0, 0.0],
+            baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
+            useFixedBase=True,
+        )
 
-        # end-effector link index (panda_hand)
-        self.ee_link_id = 11  # panda_hand link index in the URDF
+        # Initial gripper open
+        self._set_gripper(opening=0.05)
 
-        # open the gripper initially
-        self._set_gripper(opening=0.04)
+        # Cube to manipulate
+        self.cube_id = p.loadURDF("cube_small.urdf", basePosition=[0.5, 0.05, 0.02], globalScaling=1.0)
 
-        # cube to pick
-        cube_start = [0.5, 0.05, 0.02]  # on table
-        self.cube_id = p.loadURDF("cube_small.urdf", basePosition=cube_start,
-                                  globalScaling=1.0)
+        # --- Improve graspability physics ---
+        # lighter cube + higher friction, no bounce
+        p.changeDynamics(self.cube_id, -1, mass=0.015,
+                         lateralFriction=1.4, restitution=0.0,
+                         rollingFriction=0.002, spinningFriction=0.002)
+        # table friction so cube doesn't skate
+        p.changeDynamics(self.table_id, -1, lateralFriction=1.0, restitution=0.0)
 
-        # goal marker (visual only)
-        self.goal_visual = p.createVisualShape(p.GEOM_CYLINDER, radius=0.05, length=0.001,
-                                               rgbaColor=[0, 1, 0, 0.5])
-        self.goal_body = p.createMultiBody(baseMass=0,
-                                           baseCollisionShapeIndex=-1,
-                                           baseVisualShapeIndex=self.goal_visual,
-                                           basePosition=[self.goal_xy[0], self.goal_xy[1], 0.02])
+        # Visual goal ring (for GUI)
+        goal_vis = p.createVisualShape(
+            p.GEOM_CYLINDER, radius=0.05, length=0.001, rgbaColor=[0, 1, 0, 0.5]
+        )
+        p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=goal_vis,
+            basePosition=[self.goal_xy[0], self.goal_xy[1], 0.02],
+        )
 
-        # move EE to a good start pose
-        self._move_ee_abs([0.4, 0.0, 0.3], yaw=0.0)
+        # Move EE to start pose
+        self._move_ee_abs([0.4, 0.0, 0.30], yaw=0.0)
 
-    # ---------- helpers ----------
+        # Mild domain randomization (camera jitter in GUI)
+        if self.domain_randomization and self.render_mode == "human":
+            try:
+                p.resetDebugVisualizerCamera(
+                    cameraDistance=1.2,
+                    cameraYaw=np.random.uniform(-15, 15),
+                    cameraPitch=np.random.uniform(-20, -5),
+                    cameraTargetPosition=[0.45, 0.0, 0.1],
+                )
+            except Exception:
+                pass
+
+    # --------------------------------------------------------------------- #
+    # Helpers
+    # --------------------------------------------------------------------- #
     def _get_ee_pose(self):
         state = p.getLinkState(self.robot_id, self.ee_link_id)
         pos = np.array(state[0], dtype=np.float32)
-        euler = p.getEulerFromQuaternion(state[1])
-        yaw = np.float32(euler[2])
+        yaw = np.float32(p.getEulerFromQuaternion(state[1])[2])
         return pos, yaw
 
     def _get_cube_pose(self):
-        pos, orn = p.getBasePositionAndOrientation(self.cube_id)
+        pos, _ = p.getBasePositionAndOrientation(self.cube_id)
         return np.array(pos, dtype=np.float32)
 
     def _ik(self, target_pos, yaw=0.0):
-        # Keep fixed orientation (downward facing hand)
-        target_ori = p.getQuaternionFromEuler([math.pi, 0, yaw])
-        joint_poses = p.calculateInverseKinematics(self.robot_id, self.ee_link_id,
-                                                   target_pos, target_ori,
-                                                   maxNumIterations=200,
-                                                   residualThreshold=1e-3)
+        target_ori = p.getQuaternionFromEuler([math.pi, 0, yaw])  # wrist-down
+        joint_poses = p.calculateInverseKinematics(
+            self.robot_id, self.ee_link_id, target_pos, target_ori,
+            maxNumIterations=200, residualThreshold=1e-3
+        )
         return joint_poses
 
     def _move_ee_abs(self, xyz, yaw=0.0):
@@ -124,23 +175,38 @@ class PickPlaceEnv(gym.Env):
             p.stepSimulation()
 
     def _set_gripper(self, opening: float):
-        # panda_finger_joint1 = 9, panda_finger_joint2 = 10
+        # Stronger finger force helps lifting
         opening = float(np.clip(opening, 0.0, 0.08))
-        p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, opening, force=50)
-        p.setJointMotorControl2(self.robot_id,10, p.POSITION_CONTROL, opening, force=50)
+        p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, opening, force=200)
+        p.setJointMotorControl2(self.robot_id, 10, p.POSITION_CONTROL, opening, force=200)
         for _ in range(5):
             p.stepSimulation()
 
-    # ---------- gym API ----------
+    # --------------------------------------------------------------------- #
+    # Gym API
+    # --------------------------------------------------------------------- #
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.step_count = 0
         self._load_world()
+        self._grasp_locked_steps = 0
 
-        # randomize cube XY a bit for diversity
-        jitter = np.random.uniform(low=[-0.02, -0.02], high=[0.02, 0.02])
+        # Curriculum-controlled jitter
+        jitter_xy = self._easy_jitter_xy if self._easy_mode else self._hard_jitter_xy
+        jitter = np.random.uniform(low=[-jitter_xy, -jitter_xy], high=[jitter_xy, jitter_xy])
         cube_pos = np.array([0.5, 0.05, 0.02]) + np.append(jitter, 0.0)
-        p.resetBasePositionAndOrientation(self.cube_id, cube_pos, [0,0,0,1])
+
+        # Optional small sensor noise
+        if self.domain_randomization:
+            noise = np.random.normal(0.0, 0.001, size=3)  # ~1 mm
+            cube_pos = cube_pos + noise
+
+        p.resetBasePositionAndOrientation(self.cube_id, cube_pos, [0, 0, 0, 1])
+
+        # Initialize potentials for shaping
+        ee_pos, _ = self._get_ee_pose()
+        self._last_dist_ee_cube = float(np.linalg.norm(ee_pos - cube_pos))
+        self._last_dist_cube_goal = float(np.linalg.norm(cube_pos[:2] - self.goal_xy))
 
         obs = self._get_obs()
         info = {}
@@ -149,88 +215,154 @@ class PickPlaceEnv(gym.Env):
     def _get_obs(self):
         ee_pos, ee_yaw = self._get_ee_pose()
         cube_pos = self._get_cube_pose()
-        obs = np.concatenate([ee_pos, [ee_yaw], cube_pos]).astype(np.float32)
-        return obs
+        return np.concatenate([ee_pos, [ee_yaw], cube_pos]).astype(np.float32)
 
     def step(self, action):
         self.step_count += 1
         action = np.clip(action, self.action_space.low, self.action_space.high)
         dpos = action[:3]
-        grip_cmd = action[3]  # -1 close, +1 open
+        grip_cmd = action[3]
 
         ee_pos, ee_yaw = self._get_ee_pose()
         target = ee_pos + dpos
-        # workspace clamp
+
+        # Workspace clamp
         target[0] = np.clip(target[0], 0.2, 0.7)
         target[1] = np.clip(target[1], -0.3, 0.3)
         target[2] = np.clip(target[2], 0.02, 0.5)
 
+        # Move EE
         self._move_ee_abs(target, yaw=ee_yaw)
 
-        # simple gripper mapping
-        if grip_cmd < 0:
-            self._set_gripper(0.0)   # close
-        else:
-            self._set_gripper(0.06)  # open
+        # Auto-close heuristic to help early exploration
+        cube_now = self._get_cube_pose()
+        if np.linalg.norm(target - cube_now) < 0.06 and target[2] > (cube_now[2] + 0.03):
+            grip_cmd = -1.0  # try to grasp if we are right above the cube
 
-        # step physics a bit
+
+        cube_now = self._get_cube_pose()
+        xy_dist = np.linalg.norm((target[:2] - cube_now[:2]))
+        z_above = target[2] - cube_now[2]
+
+        # Auto-close if we're nicely aligned above the cube
+        if xy_dist < 0.025 and 0.02 <= z_above <= 0.06:
+            grip_cmd = -1.0
+            # engage grasp lock for a short window
+            self._grasp_locked_steps = max(self._grasp_locked_steps, self._grasp_lock_horizon)
+
+        # While locked, keep gripper closed regardless of policy blips
+        if self._grasp_locked_steps > 0:
+            grip_cmd = -1.0
+            self._grasp_locked_steps -= 1
+
+
+        # Map grip command
+        if grip_cmd < 0:
+            self._set_gripper(0.0)    # close
+        else:
+            self._set_gripper(0.06)   # open
+
+        # A few substeps for stability
         for _ in range(4):
             p.stepSimulation()
 
+        # Compute reward + termination
         obs = self._get_obs()
-        reward, terminated = self._compute_reward_done()
-        truncated = self.step_count >= self.max_steps
-        info = {}
-        return obs, reward, terminated, truncated, info
+        reward, success = self._compute_reward_done()
 
+        truncated = self.step_count >= self.max_steps
+        done = bool(success)
+
+        # Update potentials for next step (potential-based shaping)
+        ee_pos2, _ = self._get_ee_pose()
+        cube2 = self._get_cube_pose()
+        self._last_dist_ee_cube = float(np.linalg.norm(ee_pos2 - cube2))
+        self._last_dist_cube_goal = float(np.linalg.norm(cube2[:2] - self.goal_xy))
+
+        info = {"success": success}
+        return obs, reward, done, truncated, info
+
+    # --------------------------------------------------------------------- #
+    # Reward & success
+    # --------------------------------------------------------------------- #
     def _compute_reward_done(self):
-        # positions
         ee_pos, _ = self._get_ee_pose()
         cube = self._get_cube_pose()
-        goal_xy = self.goal_xy
 
-        # distance terms
-        dist_ee_cube = np.linalg.norm(ee_pos - cube)                # 3D
-        dist_cube_goal = np.linalg.norm(cube[:2] - goal_xy)         # XY
+        dist_ee_cube = np.linalg.norm(ee_pos - cube)
+        dist_cube_goal = np.linalg.norm(cube[:2] - self.goal_xy)
 
-        # shaping weights (tune as needed)
-        w_reach = 0.5     # encourage EE near cube
-        w_lift  = 2.0     # encourage lifting
-        w_goal  = 0.5     # encourage moving cube toward goal
-        w_time  = 0.0005  # small time penalty
+        # Potential-based improvements (positive if improving)
+        d_reach = 0.0 if self._last_dist_ee_cube is None else (self._last_dist_ee_cube - dist_ee_cube)
+        d_goal = 0.0 if self._last_dist_cube_goal is None else (self._last_dist_cube_goal - dist_cube_goal)
 
-        # normalize-ish baselines to keep rewards in a sane range
-        reach_reward = -w_reach * dist_ee_cube                      # closer is better
-        lift_reward  =  w_lift * max(0.0, cube[2] - 0.03)           # above table plane
-        goal_reward  = -w_goal * dist_cube_goal                     # closer to goal
+        reach_reward = self.w_reach * d_reach
+        goal_reward = self.w_goal * d_goal
+        lift_reward = self.w_lift * max(0.0, cube[2] - 0.03)  # absolute lift above table
 
-        # crude grasp heuristic: if gripper is closed and cube is above 0.05m, give a little bonus
-        # (you can do better by checking contact points)
-        grasp_bonus = 0.0
-        finger_left = p.getJointState(self.robot_id, 9)[0]
-        finger_right = p.getJointState(self.robot_id,10)[0]
-        gripper_closed = (finger_left < 0.01 and finger_right < 0.01)
-        if gripper_closed and cube[2] > 0.05:
-            grasp_bonus = 0.2
+        # Encourage good approach: be directly above cube at a small hover height
+        xy_err = np.linalg.norm((ee_pos[:2] - cube[:2]))
+        z_err  = abs((cube[2] + self.approach_height) - ee_pos[2])
 
-        # success condition
-        near_goal = dist_cube_goal < 0.08
-        lifted = cube[2] > 0.15
-        success = (near_goal and lifted)
+        approach_reward = 0.15 * ( -xy_err ) + 0.15 * ( -z_err )
 
-        reward = reach_reward + lift_reward + goal_reward + grasp_bonus - w_time
+
+        # Simple grasp bonus: if closed and slightly lifted
+        finger_l = p.getJointState(self.robot_id, 9)[0]
+        finger_r = p.getJointState(self.robot_id, 10)[0]
+        gripper_closed = (finger_l < 0.01 and finger_r < 0.01)
+        lift_bias = 0.0
+        if gripper_closed:
+            lift_bias = 0.5 * max(0.0, cube[2] - 0.03)  # stronger reward once grasped
+        grasp_bonus = 0.2 if (gripper_closed and cube[2] > 0.05) else 0.0
+
+        # Success checks (staged)
+        near_goal = dist_cube_goal < self.near_thresh
+        lifted = cube[2] > self.lift_thresh
+
+        if self.success_mode == "and":
+            success = (near_goal and lifted)
+        elif self.success_mode == "lift":
+            success = lifted
+        else:  # "near"
+            success = near_goal
+
+        reward = (reach_reward + goal_reward + lift_reward +
+                    grasp_bonus + approach_reward + lift_bias -
+                    self.w_time)
         if success:
-            reward += 2.0  # terminal success bonus
+            reward += self.success_bonus
 
-        done = bool(success)
-        return float(reward), done
+        return float(reward), bool(success)
 
+    # --------------------------------------------------------------------- #
+    # Config helpers
+    # --------------------------------------------------------------------- #
+    def set_easy_mode(self, flag: bool):
+        """Enable/disable curriculum easy mode (smaller object jitter)."""
+        self._easy_mode = bool(flag)
+
+    def set_success_mode(self, mode: str):
+        """Set success criterion: 'and' | 'lift' | 'near'."""
+        assert mode in ("and", "lift", "near")
+        self.success_mode = mode
+
+    def set_thresholds(self, near_thresh: float = None, lift_thresh: float = None):
+        """Adjust success thresholds (meters)."""
+        if near_thresh is not None:
+            self.near_thresh = float(near_thresh)
+        if lift_thresh is not None:
+            self.lift_thresh = float(lift_thresh)
+
+    # --------------------------------------------------------------------- #
+    # Rendering / teardown
+    # --------------------------------------------------------------------- #
     def render(self):
         if self.render_mode == "human":
             time.sleep(self.time_step)
         else:
-            # return an RGB array if needed later
-            width, height, view, proj, _, _ = p.getDebugVisualizerCamera()
+            # Return an RGB frame if needed
+            width, height, _, _, _, _ = p.getDebugVisualizerCamera()
             img = p.getCameraImage(width, height)[2]
             return np.array(img)
 
