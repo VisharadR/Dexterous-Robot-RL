@@ -22,6 +22,12 @@ class PickPlaceEnv(gym.Env):
         self.render_mode = render_mode
         self.domain_randomization = bool(domain_randomization)
 
+        # speed knobs
+        self.action_repeat = 2         # repeat same action this many frames
+        self.substeps = 1              # physics substeps per frame (keep low for speed)
+        self.fast_dynamics = True      # use faster (less accurate) solver
+        self.control_settle_steps = 60   # 6–12 works well
+
         # Small deltas for stable control
         self.action_space = spaces.Box(
             low=np.array([-0.01, -0.01, -0.01, -1.0], dtype=np.float32),
@@ -42,6 +48,12 @@ class PickPlaceEnv(gym.Env):
         self.physics_client = None
         self.robot_id = None
         self.ee_link_id = 11  # panda_hand link index in pybullet_data/franka_panda
+        self.arm_joint_indices = list(range(7))  # 0..6 are Panda arm joints
+        self.joint_lower = None
+        self.joint_upper = None
+        self.joint_range = None
+        self.joint_rest  = np.array([0.0, -0.4, 0.0, -1.8, 0.0, 1.8, 0.8], dtype=np.float32)  # elbow-down, wrist bent
+        self.joint_damping = [0.05]*7  # light damping helps IK stability
         self.table_id = None
         self.cube_id = None
 
@@ -93,18 +105,40 @@ class PickPlaceEnv(gym.Env):
         p.setGravity(0, 0, -9.81)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
+        if self.fast_dynamics:
+        # fewer solver iterations, faster contact handling
+            p.setPhysicsEngineParameter(
+                fixedTimeStep=self.time_step,
+                numSolverIterations=20,           # default ~50
+                numSubSteps=self.substeps,        # we also control substeps externally
+                collisionFilterMode=1,
+                enableConeFriction=0,
+                deterministicOverlappingPairs=1,
+            )
+
         # Ground + table
         p.loadURDF("plane.urdf")
         table_shift = [0.5, 0.0, -0.65]
         self.table_id = p.loadURDF("table/table.urdf", basePosition=table_shift)
 
         # Robot (fixed base)
+        flags = p.URDF_USE_SELF_COLLISION | p.URDF_USE_SELF_COLLISION_INCLUDE_PARENT
         self.robot_id = p.loadURDF(
             "franka_panda/panda.urdf",
             basePosition=[0.0, 0.0, 0.0],
             baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
             useFixedBase=True,
+            flags=flags
         )
+
+        lower, upper = [], []
+        for j in self.arm_joint_indices:
+            info = p.getJointInfo(self.robot_id, j)
+            lower.append(info[8])  # lower limit
+            upper.append(info[9])  # upper limit
+        self.joint_lower = np.array(lower, dtype=np.float32)
+        self.joint_upper = np.array(upper, dtype=np.float32)
+        self.joint_range = (self.joint_upper - self.joint_lower)
 
         # Initial gripper open
         self._set_gripper(opening=0.05)
@@ -160,25 +194,43 @@ class PickPlaceEnv(gym.Env):
         return np.array(pos, dtype=np.float32)
 
     def _ik(self, target_pos, yaw=0.0):
-        target_ori = p.getQuaternionFromEuler([math.pi, 0, yaw])  # wrist-down
-        joint_poses = p.calculateInverseKinematics(
-            self.robot_id, self.ee_link_id, target_pos, target_ori,
-            maxNumIterations=200, residualThreshold=1e-3
+        # wrist-down orientation
+        target_ori = p.getQuaternionFromEuler([math.pi, 0, yaw])
+        # Fallback if limits not initialized yet
+        if self.joint_lower is None:
+            return p.calculateInverseKinematics(
+                self.robot_id, self.ee_link_id, target_pos, target_ori,
+                maxNumIterations=300, residualThreshold=1e-3
+            )
+
+        q = p.calculateInverseKinematics(
+            bodyUniqueId=self.robot_id,
+            endEffectorLinkIndex=self.ee_link_id,
+            targetPosition=target_pos,
+            targetOrientation=target_ori,
+            lowerLimits=self.joint_lower.tolist(),
+            upperLimits=self.joint_upper.tolist(),
+            jointRanges=self.joint_range.tolist(),
+            restPoses=self.joint_rest.tolist(),
+            # jointDamping=self.joint_damping,
+            maxNumIterations=300,
+            residualThreshold=1e-3
         )
-        return joint_poses
+        return q
 
     def _move_ee_abs(self, xyz, yaw=0.0):
         joint_poses = self._ik(xyz, yaw)
         for j, q in enumerate(joint_poses[:7]):  # first 7 joints are arm
-            p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL, q, force=200)
-        for _ in range(10):
+            p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL, targetPosition=q, force=300, positionGain=0.3, velocityGain=1.0, maxVelocity=2.0)
+        for _ in range(self.control_settle_steps):
             p.stepSimulation()
 
     def _set_gripper(self, opening: float):
         # Stronger finger force helps lifting
+        force = 220
         opening = float(np.clip(opening, 0.0, 0.08))
-        p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, opening, force=200)
-        p.setJointMotorControl2(self.robot_id, 10, p.POSITION_CONTROL, opening, force=200)
+        p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, opening, force=force)
+        p.setJointMotorControl2(self.robot_id, 10, p.POSITION_CONTROL, opening, force=force)
         for _ in range(5):
             p.stepSimulation()
 
@@ -194,7 +246,7 @@ class PickPlaceEnv(gym.Env):
         # Curriculum-controlled jitter
         jitter_xy = self._easy_jitter_xy if self._easy_mode else self._hard_jitter_xy
         jitter = np.random.uniform(low=[-jitter_xy, -jitter_xy], high=[jitter_xy, jitter_xy])
-        cube_pos = np.array([0.5, 0.05, 0.02]) + np.append(jitter, 0.0)
+        cube_pos = np.array([0.5, 0.05, 0.03]) + np.append(jitter, 0.0)
 
         # Optional small sensor noise
         if self.domain_randomization:
@@ -220,68 +272,55 @@ class PickPlaceEnv(gym.Env):
     def step(self, action):
         self.step_count += 1
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        dpos = action[:3]
-        grip_cmd = action[3]
+        dpos = action[:3]; grip_cmd = action[3]
 
         ee_pos, ee_yaw = self._get_ee_pose()
         target = ee_pos + dpos
-
-        # Workspace clamp
         target[0] = np.clip(target[0], 0.2, 0.7)
         target[1] = np.clip(target[1], -0.3, 0.3)
-        target[2] = np.clip(target[2], 0.02, 0.5)
+        target[2] = np.clip(target[2], 0.012, 0.5)
 
-        # Move EE
+        # set joint targets once
         self._move_ee_abs(target, yaw=ee_yaw)
 
-        # Auto-close heuristic to help early exploration
-        cube_now = self._get_cube_pose()
-        if np.linalg.norm(target - cube_now) < 0.06 and target[2] > (cube_now[2] + 0.03):
-            grip_cmd = -1.0  # try to grasp if we are right above the cube
-
-
+        # auto-close heuristic + lock (keep your existing logic)
         cube_now = self._get_cube_pose()
         xy_dist = np.linalg.norm((target[:2] - cube_now[:2]))
         z_above = target[2] - cube_now[2]
-
-        # Auto-close if we're nicely aligned above the cube
-        if xy_dist < 0.025 and 0.02 <= z_above <= 0.06:
+        # if xy_dist < 0.025 and 0.02 <= z_above <= 0.06:
+        if xy_dist < 0.03 and z_above > 0.05:
+            # gently descend toward grasp height
+            target[2] -= 0.01 # 8 mm per control step
+            self._move_ee_abs(target, yaw=ee_yaw) # re-send pose and settle
             grip_cmd = -1.0
-            # engage grasp lock for a short window
             self._grasp_locked_steps = max(self._grasp_locked_steps, self._grasp_lock_horizon)
-
-        # While locked, keep gripper closed regardless of policy blips
         if self._grasp_locked_steps > 0:
             grip_cmd = -1.0
             self._grasp_locked_steps -= 1
 
+        # map grip once
+        if grip_cmd < 0: self._set_gripper(0.0)
+        else:            self._set_gripper(0.06)
 
-        # Map grip command
-        if grip_cmd < 0:
-            self._set_gripper(0.0)    # close
-        else:
-            self._set_gripper(0.06)   # open
+        # physics stepping (fast)
+        for _ in range(self.action_repeat):
+            for __ in range(self.substeps):
+                p.stepSimulation()
 
-        # A few substeps for stability
-        for _ in range(4):
-            p.stepSimulation()
-
-        # Compute reward + termination
         obs = self._get_obs()
         reward, success = self._compute_reward_done()
-
         truncated = self.step_count >= self.max_steps
-        done = bool(success)
 
-        # Update potentials for next step (potential-based shaping)
+        # update potentials (unchanged)
         ee_pos2, _ = self._get_ee_pose()
         cube2 = self._get_cube_pose()
         self._last_dist_ee_cube = float(np.linalg.norm(ee_pos2 - cube2))
         self._last_dist_cube_goal = float(np.linalg.norm(cube2[:2] - self.goal_xy))
 
         info = {"success": success}
-        return obs, reward, done, truncated, info
-
+        return obs, reward, bool(success), truncated, info
+    
+    
     # --------------------------------------------------------------------- #
     # Reward & success
     # --------------------------------------------------------------------- #
